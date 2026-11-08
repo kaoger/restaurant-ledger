@@ -152,6 +152,16 @@ select.role{font-size:14px;padding:6px 8px;border:1px solid var(--line);border-r
 .detail-line{font-size:12px;color:var(--muted);padding:0 0 6px;margin-top:-4px;font-family:var(--font-num)}
 .pf{display:flex;flex-direction:column;gap:2px;padding:6px 0;border-bottom:1px dashed var(--line)}
 .pf:last-of-type{border-bottom:0}
+.po-item{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-top:1px dashed var(--line);font-size:15px}
+.po-item small{display:block;font-size:12px;color:var(--muted)}
+.warn-t{color:var(--neg)}
+.po-form{display:flex;flex-direction:column;gap:8px;margin-top:8px;padding:10px;border-radius:12px;background:var(--paper)}
+.po-dates{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}
+.po-form .add-line{align-items:center}
+.po-form .add-line .btn{flex:none;white-space:nowrap;padding:10px 14px}
+.po-form .add-line input.amt{min-width:0}
+.po-dates label{display:flex;flex-direction:column;font-size:12px;color:var(--muted);gap:2px}
+.po-dates input{font-size:16px;padding:8px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);width:100%;min-width:0;max-width:100%;box-sizing:border-box}
 .ledger td.pos{color:var(--pos)}
 .ledger td.neg{color:var(--neg)}
 
@@ -274,6 +284,9 @@ function localStore(){
     saveSettings(d){ put('settings', d); notify('settings'); return Promise.resolve(); },
     subMonth(ym, cb){ return sub('m:'+ym, () => cb(get('m:'+ym)||{}, meta)); },
     saveDay(ym, dd, d){ const m = get('m:'+ym)||{}; m[dd] = d; put('m:'+ym, m); notify('m:'+ym); return Promise.resolve(); },
+    getMonthSync(ym){ return get('m:'+ym) || {}; },
+    getKey(k){ return get('k:'+k); },
+    setKey(k, v){ put('k:'+k, v); notify('k:'+k); return Promise.resolve(); },
     mergeDays(ym, patchFn){ const m = get('m:'+ym)||{}; const out = patchFn(m) || m; put('m:'+ym, out); notify('m:'+ym); return Promise.resolve(); },
     subFixed(ym, cb){ return sub('f:'+ym, () => cb(get('f:'+ym), meta)); },
     saveFixed(ym, d){ put('f:'+ym, d); notify('f:'+ym); return Promise.resolve(); }
@@ -578,10 +591,12 @@ function monthStats(){
   const fixedItems = (S.fixed.items||[]).filter(f => (f.name||'').trim() || f.amt);
   const fixed = fixedItems.reduce((a,f) => a + (Number(f.amt)||0), 0);
   const items = Object.entries(byItem).map(([k,v]) => ({name:k, amt:v.amt, n:v.n})).sort((a,b) => b.amt - a.amt);
-  const payouts = S.fixed.payouts || {};
+  const allPo = loadPayouts();
   const platforms = S.settings.channels.filter(c => c.role === 'extra').map(c => {
-    const gross = byCh[c.id] || 0; const paid = payouts[c.id];
-    return {id:c.id, name:c.name, gross, paid: paid == null ? null : Number(paid), fee: paid == null ? 0 : gross - Number(paid)};
+    const gross = byCh[c.id] || 0;
+    const list = allPo.filter(p => p.ch === c.id && p.from.slice(0,7) <= ym && p.to.slice(0,7) >= ym).map(p => Object.assign({}, p, payoutCalc(p)));
+    const fee = list.reduce((a,p) => a + (p.gross ? p.fee * (p.byMonth[ym] || 0) / p.gross : 0), 0);
+    return {id:c.id, name:c.name, gross, list, fee: Math.round(fee), has: list.length > 0};
   });
   const platFee = platforms.reduce((a,p) => a + p.fee, 0);
   return {n, rows, byCh, items, rev, exp, fixed, fixedItems, platforms, platFee, diff, diffDays, recorded, net: rev - exp - fixed - platFee};
@@ -617,14 +632,25 @@ function renderMonth(){
       '<div class="chips">' + FIXED_SUGGEST.map(n => '<button class="chip" data-addfixed="' + esc(n) + '">' + esc(n) + '</button>').join('') + '<button class="chip add" data-addfixed="">＋其他</button></div>' +
     '</section>' +
 
-    (st.platforms.length ? '<section class="card payout-box"><div class="card-h"><h2>外送平台對帳</h2><span class="hint">平台撥款進來後填實際收到的錢</span></div>' +
-      st.platforms.map(pf =>
-        '<div class="pf">' +
-          '<div class="line"><span>' + esc(pf.name) + '（本月合計）</span><b>' + fmt(pf.gross) + '</b></div>' +
-          '<label class="row" for="po-' + esc(pf.id) + '"><span>實際撥款</span><input class="amt" id="po-' + esc(pf.id) + '" data-payout="' + esc(pf.id) + '" inputmode="numeric" autocomplete="off" placeholder="還沒撥款" value="' + esc(showAmt(pf.paid)) + '"></label>' +
-          '<div class="line strong"><span>平台抽成＋促銷</span><b id="pf-' + esc(pf.id) + '">' + (pf.paid == null ? '—' : fmt(pf.fee)) + '</b></div>' +
-        '</div>').join('') +
-      '<div class="hint">不用一筆一筆算服務費和促銷，訂單金額減掉實際撥款，差額就是平台拿走的，會算進月淨利的支出。</div>' +
+    (st.platforms.length ? '<section class="card payout-box"><div class="card-h"><h2>外送平台對帳</h2><span class="hint">每次撥款進來記一筆</span></div>' +
+      st.platforms.map(pf => {
+        const def = nextPayoutRange(pf.id);
+        return '<div class="pf">' +
+          '<div class="line"><span>本月 ' + esc(pf.name) + '</span><b>' + fmt(pf.gross) + '</b></div>' +
+          (pf.list.length ? pf.list.map(p =>
+            '<div class="po-item"><div><b>' + mdLabel(p.from) + '～' + mdLabel(p.to) + '</b>　撥款 <span class="num">' + fmt(p.amount) + '</span>' +
+              '<small>訂單 ' + fmt(p.gross) + '・被扣 ' + fmt(p.fee) + (p.gross ? '（' + (p.fee / p.gross * 100).toFixed(1) + '%）' : '') +
+              (p.missing ? '・<span class="warn-t">有 ' + p.missing + ' 天沒記 foodpanda</span>' : '') + '</small></div>' +
+              '<button class="del" data-delpo="' + esc(p.id) + '" aria-label="刪除這筆撥款">×</button></div>').join('')
+            : '<div class="empty">這個月還沒有撥款紀錄</div>') +
+          '<div class="po-form">' +
+            '<div class="po-dates"><label for="pof-' + esc(pf.id) + '">從<input type="date" id="pof-' + esc(pf.id) + '" value="' + def.from + '"></label>' +
+            '<label for="pot-' + esc(pf.id) + '">到<input type="date" id="pot-' + esc(pf.id) + '" value="' + def.to + '"></label></div>' +
+            '<div class="add-line"><input class="amt" id="poa-' + esc(pf.id) + '" inputmode="numeric" autocomplete="off" placeholder="匯進來多少" aria-label="撥款金額" style="flex:1;width:auto"><button class="btn" data-addpo="' + esc(pf.id) + '">記這筆撥款</button></div>' +
+          '</div>' +
+        '</div>';
+      }).join('') +
+      '<div class="hint">日期填 foodpanda 對帳單上這筆撥款涵蓋的訂單日期。系統會把那幾天的訂單金額加起來，減掉實際匯進來的錢，差額就是服務費加促銷，自動算進每個月的支出。</div>' +
     '</section>' : '') +
     '<section class="card"><div class="card-h"><h2>每日明細</h2><span class="hint">點一列可以去改那天</span></div>' +
       '<div class="table-wrap"><table class="ledger"><thead><tr><th>日期</th><th>總營業額</th>' +
@@ -666,7 +692,7 @@ function renderMonthSummary(st){
       '<div class="tile"><small>每日支出合計</small><b>' + fmt(st.exp) + '</b></div>' +
       '<div class="tile"><small>固定支出</small><b>' + fmt(st.fixed) + '</b></div>' +
       '<div class="tile"><small>日均營業額・' + st.recorded + ' 天有記</small><b>' + fmt(avg) + '</b></div>' +
-      '<div class="tile"><small>外送平台抽成＋促銷</small><b>' + (st.platforms.some(p => p.paid != null) ? fmt(st.platFee) : '—') + '</b></div>' +
+      '<div class="tile"><small>外送平台抽成＋促銷</small><b>' + (st.platforms.some(p => p.has) ? fmt(st.platFee) : '—') + '</b></div>' +
       '<div class="tile"><small>支出佔營業額</small><b>' + (st.rev ? ((st.exp + st.fixed + st.platFee) / st.rev * 100).toFixed(1) + '%' : '—') + '</b></div>' +
       '<div class="tile"><small>現金短溢累計</small><b class="' + (st.diff > 0 ? 'pos' : st.diff < 0 ? 'neg' : '') + '">' + (st.diffDays ? fmtS(st.diff) : '—') + '</b></div>' +
     '</div>';
@@ -776,7 +802,7 @@ function buildTables(){
   pl.push(['每日支出合計', st.exp], ['',''], ['月固定支出','']);
   st.fixedItems.forEach(f => pl.push(['　' + (f.name || '未命名'), Number(f.amt)||0]));
   pl.push(['固定支出合計', st.fixed], ['',''], ['外送平台抽成＋促銷（訂單金額 − 實際撥款）','']);
-  st.platforms.forEach(pf => pl.push(['　' + pf.name + (pf.paid == null ? '（尚未撥款）' : ''), pf.fee]));
+  st.platforms.forEach(pf => pl.push(['　' + pf.name + (pf.has ? '' : '（本月還沒有撥款紀錄）'), pf.fee]));
   pl.push(['平台抽成合計', st.platFee], ['',''], ['本月淨利', st.net], ['記帳天數', st.recorded], ['現金短溢累計', st.diffDays ? st.diff : 0]);
   return {daily, detail, items, pl};
 }
@@ -810,6 +836,46 @@ async function copyTsv(){
   const tsv = t.daily.map(r => r.map(x => String(x == null ? '' : x).replace(/\t|\n/g,' ')).join('\t')).join('\n');
   try { await navigator.clipboard.writeText(tsv); toast('已複製日報表，到 Excel 貼上即可'); }
   catch(e) { toast('這裡不能複製，請改用「匯出 Excel」'); }
+}
+
+/* ---------- 外送平台撥款 ---------- */
+function loadPayouts(){ try { const v = S.store && S.store.getKey ? S.store.getKey('payouts') : null; return Array.isArray(v) ? v : []; } catch(e) { return []; } }
+function mdLabel(iso){ const p = parts(iso); return p.m + '/' + p.d; }
+/* Sum a channel's order amounts from `from` to `to` (inclusive), also per month, counting days with nothing entered */
+function payoutCalc(p){
+  let gross = 0, missing = 0; const byMonth = {};
+  const cache = {};
+  for (let d = p.from, guard = 0; d <= p.to && guard < 400; d = addDays(d,1), guard++) {
+    const ym = d.slice(0,7);
+    const m = cache[ym] || (cache[ym] = (ym === S.ym ? S.days : (S.store.getMonthSync ? S.store.getMonthSync(ym) : {})) || {});
+    const day = m[d.slice(8)];
+    const v = day && day.rev && day.rev[p.ch];
+    if (v == null || v === '') missing++;
+    const n = Number(v) || 0; gross += n; byMonth[ym] = (byMonth[ym] || 0) + n;
+  }
+  return {gross, missing, byMonth, fee: gross - (Number(p.amount) || 0)};
+}
+function nextPayoutRange(ch){
+  const last = loadPayouts().filter(p => p.ch === ch).sort((a,b) => a.to < b.to ? 1 : -1)[0];
+  const from = last ? addDays(last.to, 1) : S.ym + '-01';
+  return {from, to: addDays(from, 13)};
+}
+async function addPayout(ch){
+  const from = $('#pof-'+ch).value, to = $('#pot-'+ch).value, amount = parseAmt($('#poa-'+ch).value);
+  if (!from || !to) { toast('請填撥款涵蓋的日期'); return; }
+  if (from > to) { toast('「從」的日期要在「到」之前'); return; }
+  if (!amount) { toast('請填匯進來的金額'); $('#poa-'+ch).focus(); return; }
+  const list = loadPayouts();
+  if (list.some(p => p.ch === ch && !(p.to < from || p.from > to))) { if (!window.confirm('這段日期跟之前記的撥款有重疊，確定要再記一筆嗎？')) return; }
+  list.push({id: uid(), ch, from, to, amount, createdAt: new Date().toISOString()});
+  await S.store.setKey('payouts', list);
+  renderMonth(); toast('已記下這筆撥款');
+}
+async function delPayout(id){
+  const list = loadPayouts(); const p = list.find(x => x.id === id); if (!p) return;
+  if (!window.confirm('刪除 ' + mdLabel(p.from) + '～' + mdLabel(p.to) + ' 這筆撥款（' + fmt(p.amount) + '）？')) return;
+  await S.store.setKey('payouts', list.filter(x => x.id !== id));
+  renderMonth();
 }
 
 /* ---------- 快一點報表匯入 ---------- */
@@ -939,6 +1005,8 @@ document.addEventListener('click', async (ev) => {
       if (!S.settings.items.includes(name)) S.settings.items.push(name); scheduleSettingsSave(); renderSettings(); $('#newItem').focus(); return;
     }
   }
+  if (ds.addpo !== undefined) { addPayout(ds.addpo); return; }
+  if (ds.delpo !== undefined) { delPayout(ds.delpo); return; }
   if (ds.additem !== undefined) {
     S.draft.exp.push({item: ds.additem, amt: null});
     renderExpRows(S.draft.exp.length - 1); updateDayTotals(); return;
@@ -974,12 +1042,6 @@ document.addEventListener('input', (ev) => {
   if (t.id === 'cashCounted') { S.draft.cashCounted = parseAmt(t.value); cleanAmt(t); updateDayTotals(); scheduleDaySave(); return; }
   if (t.id === 'note') { S.draft.note = t.value; scheduleDaySave(); return; }
   if (ds.fixname !== undefined) { S.fixed.items[Number(ds.fixname)].name = t.value; scheduleFixedSave(); return; }
-  if (ds.payout !== undefined) {
-    S.fixed.payouts = S.fixed.payouts || {}; const v = parseAmt(t.value); if (v == null) delete S.fixed.payouts[ds.payout]; else S.fixed.payouts[ds.payout] = v;
-    cleanAmt(t); const st = monthStats(); const pf = st.platforms.find(p => p.id === ds.payout); const el = document.getElementById('pf-' + ds.payout);
-    if (el && pf) el.textContent = pf.paid == null ? '—' : fmt(pf.fee);
-    renderMonthSummary(st); scheduleFixedSave(); return;
-  }
   if (ds.fixamt !== undefined) { S.fixed.items[Number(ds.fixamt)].amt = parseAmt(t.value); cleanAmt(t); renderMonthSummary(); scheduleFixedSave(); return; }
   if (ds.chname !== undefined) { S.settings.channels[Number(ds.chname)].name = t.value; scheduleSettingsSave(); return; }
 });
