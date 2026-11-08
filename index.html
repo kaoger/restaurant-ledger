@@ -222,11 +222,12 @@ nav.tabs button[aria-current="page"]{color:var(--accent);font-weight:700}
 /* role: qcTotal = 快一點總營業額；inQc = 已包含在快一點總額內、扣掉才是現金；extra = 另外收的，加進總營業額 */
 const ROLE_LABEL = {qcTotal:'快一點總營業額', inQc:'包含在快一點總額內（扣掉才是現金）', extra:'另外收的（加進總營業額）'};
 const DEFAULT_SETTINGS = {
-  version: 5,
+  version: 6,
   float: 0,
   channels: [
     {id:'qcTotal',  name:'快一點總營業額', role:'qcTotal'},
-    {id:'line',     name:'LINE Pay', role:'inQc'},
+    {id:'line',     name:'LINE Pay', role:'inQc', match:['LINE Pay']},
+    {id:'qcOnline', name:'線上支付', role:'inQc'},
     {id:'jko',      name:'街口支付', role:'extra'},
     {id:'panda',    name:'foodpanda 訂單金額', role:'extra'}
   ],
@@ -503,7 +504,7 @@ function renderDay(){
       (d.imported ? '<div class="hint imported">已從快一點報表帶入' + (d.qcOrders ? '・' + d.qcOrders + ' 筆訂單' : '') + '</div>' : '') +
       (function(){
         let lastQc = -1; ch.forEach((c,i) => { if (c.role === 'qcTotal' || c.role === 'inQc') lastQc = i; });
-        const cashRow = '<div class="row cash-row"><span><b>現金</b><i class="tag">自動算</i><small class="hint">快一點總額 − 線上付款（LINE Pay 等）</small></span><b class="num" id="revCash">0</b></div>';
+        const cashRow = '<div class="row cash-row"><span><b>現金</b><i class="tag">自動算</i><small class="hint">快一點總額 − LINE Pay − 線上支付</small></span><b class="num" id="revCash">0</b></div>';
         let html = lastQc < 0 ? cashRow : '';
         ch.forEach((c,i) => {
           html += '<label class="row" for="rev-' + esc(c.id) + '"><span>' + esc(c.name) +
@@ -1198,23 +1199,27 @@ async function init(){
     if (S.setDirty) return;
     const items = (d && Array.isArray(d.items)) ? d.items : clone(DEFAULT_SETTINGS.items);
     let chs = null, migrated = false;
-    if (d && d.version === 5 && Array.isArray(d.channels) && d.channels.length) chs = d.channels;
-    else if (d && (d.version === 3 || d.version === 4) && Array.isArray(d.channels) && d.channels.length) {
+    if (d && d.version === 6 && Array.isArray(d.channels) && d.channels.length) chs = d.channels;
+    else if (d && d.version >= 3 && d.version <= 5 && Array.isArray(d.channels) && d.channels.length) {
       const base = d.channels.filter(c => !['qcOnline','line','jko'].includes(c.id));
       const at = Math.max(0, base.findIndex(c => c.role === 'qcTotal') + 1);
-      base.splice(at, 0, clone(DEFAULT_SETTINGS.channels[1]), clone(DEFAULT_SETTINGS.channels[2]));
+      base.splice(at, 0, clone(DEFAULT_SETTINGS.channels[1]), clone(DEFAULT_SETTINGS.channels[2]), clone(DEFAULT_SETTINGS.channels[3]));
       chs = base; migrated = true;
     }
     S.settings = chs
-      ? {version:5, float: Number(d.float) || 0, channels: chs.map(c => Object.assign({role:'extra'}, c)), items}
+      ? {version:6, float: Number(d.float) || 0, channels: chs.map(c => Object.assign({role:'extra'}, c)), items}
       : Object.assign(clone(DEFAULT_SETTINGS), {items, float: (d && Number(d.float)) || 0});
     if (migrated) {
       /* 舊版把 Apple Pay 等放在 qcOnline、把報表的「線上支付／櫃檯結帳」放在街口；街口現在是另一個 APP（另外收），所以搬到 LINE Pay（快一點線上付款） */
       if (S.store.migrateDays) S.store.migrateDays(day => {
-        const r = day.rev || {}; let ch = false;
-        if (r.qcOnline != null) { r.line = (Number(r.line) || 0) + (Number(r.qcOnline) || 0); delete r.qcOnline; ch = true; }
-        if (day.imported && r.jko != null) { r.line = (Number(r.line) || 0) + (Number(r.jko) || 0); delete r.jko; ch = true; }
-        if (ch) day.rev = r; return ch;
+        const r = day.rev || {};
+        if (day.imported && day.qcDetail) {
+          const lp = Number(day.qcDetail['LINE Pay']) || 0;
+          const rest = Object.entries(day.qcDetail).reduce((a,[k,v]) => a + (k === 'LINE Pay' ? 0 : (Number(v) || 0)), 0);
+          if (d.version === 4) delete r.jko;   /* v4 put 線上支付／櫃檯結帳 into 街口 */
+          r.line = lp; r.qcOnline = rest; day.rev = r; return true;
+        }
+        return false;
       });
       S.store.saveSettings(clone(S.settings));
     }
