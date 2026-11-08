@@ -147,6 +147,11 @@ table.ledger{border-collapse:collapse;font-size:13px;min-width:100%;white-space:
 .cash-row b.num.neg{color:var(--neg)}
 .row small.hint{margin-left:2px}
 select.role{font-size:14px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--paper);color:var(--ink);max-width:100%}
+.import-btn{font-size:13px;font-weight:700;color:var(--accent);border:1px solid var(--accent);border-radius:99px;padding:4px 12px;cursor:pointer;white-space:nowrap}
+.hint.imported{color:var(--pos)}
+.detail-line{font-size:12px;color:var(--muted);padding:0 0 6px;margin-top:-4px;font-family:var(--font-num)}
+.pf{display:flex;flex-direction:column;gap:2px;padding:6px 0;border-bottom:1px dashed var(--line)}
+.pf:last-of-type{border-bottom:0}
 .ledger td.pos{color:var(--pos)}
 .ledger td.neg{color:var(--neg)}
 
@@ -196,6 +201,7 @@ nav.tabs button[aria-current="page"]{color:var(--accent);font-weight:700}
   </nav>
 </div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
+<input type="file" id="qcFile" accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" hidden>
 
 <script>
 (function(){
@@ -205,14 +211,12 @@ nav.tabs button[aria-current="page"]{color:var(--accent);font-weight:700}
 /* role: qcTotal = 快一點總營業額；inQc = 已包含在快一點總額內、扣掉才是現金；extra = 另外收的，加進總營業額 */
 const ROLE_LABEL = {qcTotal:'快一點總營業額', inQc:'包含在快一點總額內（扣掉才是現金）', extra:'另外收的（加進總營業額）'};
 const DEFAULT_SETTINGS = {
-  version: 2,
+  version: 3,
   float: 0,
   channels: [
     {id:'qcTotal',  name:'快一點總營業額', role:'qcTotal'},
     {id:'qcOnline', name:'快一點線上支付', role:'inQc'},
-    {id:'line',     name:'LINE Pay',       role:'extra'},
-    {id:'jko',      name:'街口支付',       role:'extra'},
-    {id:'panda',    name:'foodpanda',      role:'extra'}
+    {id:'panda',    name:'foodpanda 訂單金額', role:'extra'}
   ],
   items: ['菜','牛','肉','冰','豆','蛋','米','雜貨','瓦斯','包材']
 };
@@ -270,6 +274,7 @@ function localStore(){
     saveSettings(d){ put('settings', d); notify('settings'); return Promise.resolve(); },
     subMonth(ym, cb){ return sub('m:'+ym, () => cb(get('m:'+ym)||{}, meta)); },
     saveDay(ym, dd, d){ const m = get('m:'+ym)||{}; m[dd] = d; put('m:'+ym, m); notify('m:'+ym); return Promise.resolve(); },
+    mergeDays(ym, patchFn){ const m = get('m:'+ym)||{}; const out = patchFn(m) || m; put('m:'+ym, out); notify('m:'+ym); return Promise.resolve(); },
     subFixed(ym, cb){ return sub('f:'+ym, () => cb(get('f:'+ym), meta)); },
     saveFixed(ym, d){ put('f:'+ym, d); notify('f:'+ym); return Promise.resolve(); }
   };
@@ -386,8 +391,8 @@ function setYM(ym){
   }, (e) => { clearTimeout(monthTimer); S.monthStale = true; renderSync(); });
   unsubFixed = S.store.subFixed(ym, (d) => {
     if (ym !== S.ym) return;
-    if (S.fixedDirty || S.fixedSaving || focusedIn('#view-month .fixed-box')) return;
-    S.fixed = d && Array.isArray(d.items) ? d : {items:[]};
+    if (S.fixedDirty || S.fixedSaving || focusedIn('#view-month .fixed-box') || focusedIn('#view-month .payout-box')) return;
+    S.fixed = d && Array.isArray(d.items) ? Object.assign({payouts:{}}, d) : {items:[], payouts:{}};
     if (S.tab === 'month') renderMonth();
   }, () => {});
 }
@@ -474,7 +479,8 @@ function renderDay(){
   v.innerHTML =
     '<div style="display:flex;flex-direction:column;gap:12px">' +
     '<section class="card" aria-labelledby="h-rev">' +
-      '<div class="card-h"><h2 id="h-rev">營收</h2><span class="hint">照快一點後台填</span></div>' +
+      '<div class="card-h"><h2 id="h-rev">營收</h2><label class="import-btn" for="qcFile">匯入快一點報表</label></div>' +
+      (d.imported ? '<div class="hint imported">已從快一點報表帶入' + (d.qcOrders ? '・' + d.qcOrders + ' 筆訂單' : '') + '</div>' : '') +
       (function(){
         let lastQc = -1; ch.forEach((c,i) => { if (c.role === 'qcTotal' || c.role === 'inQc') lastQc = i; });
         const cashRow = '<div class="row cash-row"><span><b>現金</b><i class="tag">自動算</i><small class="hint">快一點總額 − 線上支付</small></span><b class="num" id="revCash">0</b></div>';
@@ -483,6 +489,9 @@ function renderDay(){
           html += '<label class="row" for="rev-' + esc(c.id) + '"><span>' + esc(c.name) +
             (c.role === 'inQc' ? '<i class="tag ghost">從快一點扣</i>' : '') +
             '</span><input class="amt" id="rev-' + esc(c.id) + '" data-rev="' + esc(c.id) + '" inputmode="numeric" autocomplete="off" placeholder="0" value="' + esc(showAmt(d.rev[c.id])) + '"></label>';
+          if (c.role === 'inQc' && d.qcDetail && Object.keys(d.qcDetail).length && c.id === firstInQcId()) {
+            html += '<div class="detail-line">' + Object.entries(d.qcDetail).sort((a,b) => b[1]-a[1]).map(([k,v]) => esc(k) + ' ' + fmt(v)).join('・') + '</div>';
+          }
           if (i === lastQc) html += cashRow;
         });
         return html;
@@ -569,7 +578,13 @@ function monthStats(){
   const fixedItems = (S.fixed.items||[]).filter(f => (f.name||'').trim() || f.amt);
   const fixed = fixedItems.reduce((a,f) => a + (Number(f.amt)||0), 0);
   const items = Object.entries(byItem).map(([k,v]) => ({name:k, amt:v.amt, n:v.n})).sort((a,b) => b.amt - a.amt);
-  return {n, rows, byCh, items, rev, exp, fixed, fixedItems, diff, diffDays, recorded, net: rev - exp - fixed};
+  const payouts = S.fixed.payouts || {};
+  const platforms = S.settings.channels.filter(c => c.role === 'extra').map(c => {
+    const gross = byCh[c.id] || 0; const paid = payouts[c.id];
+    return {id:c.id, name:c.name, gross, paid: paid == null ? null : Number(paid), fee: paid == null ? 0 : gross - Number(paid)};
+  });
+  const platFee = platforms.reduce((a,p) => a + p.fee, 0);
+  return {n, rows, byCh, items, rev, exp, fixed, fixedItems, platforms, platFee, diff, diffDays, recorded, net: rev - exp - fixed - platFee};
 }
 
 /* ---------- render: month ---------- */
@@ -602,6 +617,15 @@ function renderMonth(){
       '<div class="chips">' + FIXED_SUGGEST.map(n => '<button class="chip" data-addfixed="' + esc(n) + '">' + esc(n) + '</button>').join('') + '<button class="chip add" data-addfixed="">＋其他</button></div>' +
     '</section>' +
 
+    (st.platforms.length ? '<section class="card payout-box"><div class="card-h"><h2>外送平台對帳</h2><span class="hint">平台撥款進來後填實際收到的錢</span></div>' +
+      st.platforms.map(pf =>
+        '<div class="pf">' +
+          '<div class="line"><span>' + esc(pf.name) + '（本月合計）</span><b>' + fmt(pf.gross) + '</b></div>' +
+          '<label class="row" for="po-' + esc(pf.id) + '"><span>實際撥款</span><input class="amt" id="po-' + esc(pf.id) + '" data-payout="' + esc(pf.id) + '" inputmode="numeric" autocomplete="off" placeholder="還沒撥款" value="' + esc(showAmt(pf.paid)) + '"></label>' +
+          '<div class="line strong"><span>平台抽成＋促銷</span><b id="pf-' + esc(pf.id) + '">' + (pf.paid == null ? '—' : fmt(pf.fee)) + '</b></div>' +
+        '</div>').join('') +
+      '<div class="hint">不用一筆一筆算服務費和促銷，訂單金額減掉實際撥款，差額就是平台拿走的，會算進月淨利的支出。</div>' +
+    '</section>' : '') +
     '<section class="card"><div class="card-h"><h2>每日明細</h2><span class="hint">點一列可以去改那天</span></div>' +
       '<div class="table-wrap"><table class="ledger"><thead><tr><th>日期</th><th>總營業額</th>' +
         ch.map(c => '<th>' + esc(c.name) + '</th>').join('') +
@@ -624,6 +648,7 @@ function renderMonth(){
 
     '<section class="card"><div class="card-h"><h2>匯出</h2><span class="hint">日報表、支出明細、品項彙總、月損益四張工作表</span></div>' +
       '<div class="btn-row"><button class="btn" data-act="exportXlsx">匯出 Excel</button><button class="btn ghost" data-act="copyTsv">複製表格</button></div>' +
+      '<div class="btn-row"><label class="btn ghost" for="qcFile" style="text-align:center;cursor:pointer">匯入快一點報表（一次帶入多天營收）</label></div>' +
       '<div class="hint">「複製表格」可以直接貼到 Excel 或 Google 試算表。</div>' +
     '</section>' +
     '</div>';
@@ -636,12 +661,13 @@ function renderMonthSummary(st){
   const avg = st.recorded ? st.rev / st.recorded : 0;
   box.innerHTML =
     '<div class="tiles">' +
-      '<div class="tile hero"><small>本月淨利（營業額 − 每日支出 − 固定支出）</small><b class="' + (st.net < 0 ? 'neg' : '') + '">' + (st.net < 0 ? '−' : '') + fmt(Math.abs(st.net)) + '</b></div>' +
+      '<div class="tile hero"><small>本月淨利（營業額 − 每日支出 − 固定支出' + (st.platFee ? ' − 平台抽成' : '') + '）</small><b class="' + (st.net < 0 ? 'neg' : '') + '">' + (st.net < 0 ? '−' : '') + fmt(Math.abs(st.net)) + '</b></div>' +
       '<div class="tile"><small>總營業額</small><b>' + fmt(st.rev) + '</b></div>' +
       '<div class="tile"><small>每日支出合計</small><b>' + fmt(st.exp) + '</b></div>' +
       '<div class="tile"><small>固定支出</small><b>' + fmt(st.fixed) + '</b></div>' +
       '<div class="tile"><small>日均營業額・' + st.recorded + ' 天有記</small><b>' + fmt(avg) + '</b></div>' +
-      '<div class="tile"><small>支出佔營業額</small><b>' + (st.rev ? ((st.exp + st.fixed) / st.rev * 100).toFixed(1) + '%' : '—') + '</b></div>' +
+      '<div class="tile"><small>外送平台抽成＋促銷</small><b>' + (st.platforms.some(p => p.paid != null) ? fmt(st.platFee) : '—') + '</b></div>' +
+      '<div class="tile"><small>支出佔營業額</small><b>' + (st.rev ? ((st.exp + st.fixed + st.platFee) / st.rev * 100).toFixed(1) + '%' : '—') + '</b></div>' +
       '<div class="tile"><small>現金短溢累計</small><b class="' + (st.diff > 0 ? 'pos' : st.diff < 0 ? 'neg' : '') + '">' + (st.diffDays ? fmtS(st.diff) : '—') + '</b></div>' +
     '</div>';
 }
@@ -668,7 +694,7 @@ async function flushFixed(){
   if (!S.fixedDirty) return;
   if (S.fixedSaving) { S.fixedTimer = setTimeout(flushFixed, 300); return; }
   const ym = S.ym;
-  const doc = {items: (S.fixed.items||[]).filter(f => (f.name||'').trim() || f.amt).map(f => ({name:(f.name||'').trim(), amt: f.amt == null ? 0 : Number(f.amt)})), updatedAt: new Date().toISOString()};
+  const doc = {items: (S.fixed.items||[]).filter(f => (f.name||'').trim() || f.amt).map(f => ({name:(f.name||'').trim(), amt: f.amt == null ? 0 : Number(f.amt)})), payouts: Object.assign({}, S.fixed.payouts||{}), updatedAt: new Date().toISOString()};
   S.fixedSaving = true; S.fixedDirty = false;
   try { await writeWithRetry(() => S.store.saveFixed(ym, doc)); }
   catch(e){ handleWriteError(e); }
@@ -749,7 +775,9 @@ function buildTables(){
   st.items.forEach(it => pl.push(['　' + it.name, it.amt]));
   pl.push(['每日支出合計', st.exp], ['',''], ['月固定支出','']);
   st.fixedItems.forEach(f => pl.push(['　' + (f.name || '未命名'), Number(f.amt)||0]));
-  pl.push(['固定支出合計', st.fixed], ['',''], ['本月淨利', st.net], ['記帳天數', st.recorded], ['現金短溢累計', st.diffDays ? st.diff : 0]);
+  pl.push(['固定支出合計', st.fixed], ['',''], ['外送平台抽成＋促銷（訂單金額 − 實際撥款）','']);
+  st.platforms.forEach(pf => pl.push(['　' + pf.name + (pf.paid == null ? '（尚未撥款）' : ''), pf.fee]));
+  pl.push(['平台抽成合計', st.platFee], ['',''], ['本月淨利', st.net], ['記帳天數', st.recorded], ['現金短溢累計', st.diffDays ? st.diff : 0]);
   return {daily, detail, items, pl};
 }
 async function exportXlsx(){
@@ -782,6 +810,72 @@ async function copyTsv(){
   const tsv = t.daily.map(r => r.map(x => String(x == null ? '' : x).replace(/\t|\n/g,' ')).join('\t')).join('\n');
   try { await navigator.clipboard.writeText(tsv); toast('已複製日報表，到 Excel 貼上即可'); }
   catch(e) { toast('這裡不能複製，請改用「匯出 Excel」'); }
+}
+
+/* ---------- 快一點報表匯入 ---------- */
+function firstInQcId(){ const c = S.settings.channels.find(x => x.role === 'inQc'); return c ? c.id : null; }
+function qcTotalId(){ const c = S.settings.channels.find(x => x.role === 'qcTotal'); return c ? c.id : null; }
+/* Reads the 訂單列表 export: one row per item, order fields repeated. Groups by 訂單ID, skips cancelled orders,
+   dates by 下單時間, cash = 交易型態「現金結帳」, everything else counts as online. */
+function parseQcReport(rows){
+  let h = rows.findIndex(r => Array.isArray(r) && r.includes('訂單ID'));
+  if (h < 0) throw new Error('找不到「訂單ID」欄位');
+  const H = rows[h]; const col = n => H.indexOf(n);
+  const ci = {id:col('訂單ID'), pay:col('交易型態'), amt:col('總金額'), time:col('下單時間'), cancel:col('是否已取消'), plat:col('點餐平台')};
+  if (ci.pay < 0 || ci.amt < 0 || ci.time < 0) throw new Error('報表欄位不完整');
+  const seen = new Set(); const days = {};
+  for (let i = h + 1; i < rows.length; i++) {
+    const r = rows[i]; if (!r || r[ci.id] == null || r[ci.id] === '') continue;
+    const id = String(r[ci.id]); if (seen.has(id)) continue; seen.add(id);
+    if (ci.cancel >= 0 && String(r[ci.cancel]).trim() === '是') continue;
+    let iso = null; const t = r[ci.time];
+    if (t instanceof Date) iso = isoOf(t);
+    else { const m = String(t||'').match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/); if (m) iso = m[1] + '-' + pad(m[2]) + '-' + pad(m[3]); }
+    if (!iso) continue;
+    const amt = Number(r[ci.amt]) || 0;
+    const pay = String(r[ci.pay] || '其他').trim();
+    const d = days[iso] = days[iso] || {total:0, cash:0, detail:{}, orders:0};
+    d.total += amt; d.orders++;
+    if (pay === '現金結帳' || pay === '現金') d.cash += amt; else d.detail[pay] = (d.detail[pay] || 0) + amt;
+  }
+  return days;
+}
+async function importQcFile(file){
+  if (!window.XLSX) { toast('Excel 元件還沒載入，請連上網路再試'); return; }
+  let days;
+  try {
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, {type:'array', cellDates:true});
+    const ws = wb.Sheets['訂單列表'] || wb.Sheets[wb.SheetNames[0]];
+    days = parseQcReport(XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:null}));
+  } catch(e) { toast('讀不懂這個檔案，請選快一點後台匯出的「訂單列表」報表'); return; }
+  const list = Object.keys(days).sort();
+  if (!list.length) { toast('報表裡沒有找到訂單'); return; }
+  const totId = qcTotalId(), onId = firstInQcId();
+  if (!totId || !onId) { toast('請先到設定保留「快一點總營業額」和「快一點線上支付」兩欄'); return; }
+  const span = list[0].slice(5).replace('-','/') + ' 到 ' + list[list.length-1].slice(5).replace('-','/');
+  if (!window.confirm('找到 ' + list.length + ' 天的訂單（' + span + '）。\n要把這幾天的「快一點總營業額」和「線上支付」換成報表的數字嗎？\n支出、現金盤點和 foodpanda 不會動。')) return;
+  await flushDay();
+  const byYM = {};
+  list.forEach(iso => { (byYM[iso.slice(0,7)] = byYM[iso.slice(0,7)] || []).push(iso); });
+  const now = new Date().toISOString();
+  for (const ym of Object.keys(byYM)) {
+    await S.store.mergeDays(ym, m => {
+      byYM[ym].forEach(iso => {
+        const dd = iso.slice(8), x = days[iso];
+        const cur = m[dd] ? clone(m[dd]) : {date: iso, rev:{}, exp:[], cashCounted:null, note:'', float: Number(S.settings.float) || 0};
+        cur.rev = cur.rev || {};
+        cur.rev[totId] = x.total;
+        cur.rev[onId] = x.total - x.cash;
+        cur.qcDetail = x.detail; cur.qcOrders = x.orders; cur.imported = true; cur.updatedAt = now;
+        m[dd] = cur;
+      });
+      return m;
+    });
+  }
+  S.draftDate = null;
+  if (S.tab === 'day') { loadDraft(); renderDay(); renderNav(); } else if (S.tab === 'month') renderMonth();
+  toast('已帶入 ' + list.length + ' 天的快一點營收');
 }
 
 /* ---------- backup / restore (this phone only) ---------- */
@@ -880,12 +974,19 @@ document.addEventListener('input', (ev) => {
   if (t.id === 'cashCounted') { S.draft.cashCounted = parseAmt(t.value); cleanAmt(t); updateDayTotals(); scheduleDaySave(); return; }
   if (t.id === 'note') { S.draft.note = t.value; scheduleDaySave(); return; }
   if (ds.fixname !== undefined) { S.fixed.items[Number(ds.fixname)].name = t.value; scheduleFixedSave(); return; }
+  if (ds.payout !== undefined) {
+    S.fixed.payouts = S.fixed.payouts || {}; const v = parseAmt(t.value); if (v == null) delete S.fixed.payouts[ds.payout]; else S.fixed.payouts[ds.payout] = v;
+    cleanAmt(t); const st = monthStats(); const pf = st.platforms.find(p => p.id === ds.payout); const el = document.getElementById('pf-' + ds.payout);
+    if (el && pf) el.textContent = pf.paid == null ? '—' : fmt(pf.fee);
+    renderMonthSummary(st); scheduleFixedSave(); return;
+  }
   if (ds.fixamt !== undefined) { S.fixed.items[Number(ds.fixamt)].amt = parseAmt(t.value); cleanAmt(t); renderMonthSummary(); scheduleFixedSave(); return; }
   if (ds.chname !== undefined) { S.settings.channels[Number(ds.chname)].name = t.value; scheduleSettingsSave(); return; }
 });
 document.addEventListener('change', (ev) => {
   const t = ev.target, ds = t.dataset;
   if (t.id === 'datePick' && t.value) { goDate(t.value); return; }
+  if (t.id === 'qcFile' && t.files && t.files[0]) { const f = t.files[0]; t.value = ''; importQcFile(f); return; }
   if (t.id === 'restoreFile' && t.files && t.files[0]) { restore(t.files[0]); t.value = ''; return; }
   if (ds.chrole !== undefined) { S.settings.channels[Number(ds.chrole)].role = t.value; scheduleSettingsSave(); return; }
 });
@@ -927,9 +1028,9 @@ async function init(){
   S.store.subSettings((d) => {
     if (S.setDirty) return;
     const items = (d && Array.isArray(d.items)) ? d.items : clone(DEFAULT_SETTINGS.items);
-    S.settings = (d && d.version === 2 && Array.isArray(d.channels) && d.channels.length)
-      ? {version:2, float: Number(d.float) || 0, channels: d.channels.map(c => Object.assign({role:'extra'}, c)), items}
-      : Object.assign(clone(DEFAULT_SETTINGS), {items});
+    S.settings = (d && d.version === 3 && Array.isArray(d.channels) && d.channels.length)
+      ? {version:3, float: Number(d.float) || 0, channels: d.channels.map(c => Object.assign({role:'extra'}, c)), items}
+      : Object.assign(clone(DEFAULT_SETTINGS), {items, float: (d && Number(d.float)) || 0});
     if (S.tab === 'settings' && !focusedIn('#view-settings')) renderSettings();
     if (S.tab === 'day' && !focusedIn('#view-day')) renderDay();
     if (S.tab === 'month') renderMonth();
