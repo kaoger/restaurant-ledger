@@ -222,13 +222,12 @@ nav.tabs button[aria-current="page"]{color:var(--accent);font-weight:700}
 /* role: qcTotal = 快一點總營業額；inQc = 已包含在快一點總額內、扣掉才是現金；extra = 另外收的，加進總營業額 */
 const ROLE_LABEL = {qcTotal:'快一點總營業額', inQc:'包含在快一點總額內（扣掉才是現金）', extra:'另外收的（加進總營業額）'};
 const DEFAULT_SETTINGS = {
-  version: 4,
+  version: 5,
   float: 0,
   channels: [
     {id:'qcTotal',  name:'快一點總營業額', role:'qcTotal'},
-    {id:'line',     name:'LINE Pay', role:'inQc', match:['LINE Pay']},
-    {id:'jko',      name:'街口支付', role:'inQc', match:['街口支付','街口','線上支付','櫃檯結帳']},
-    {id:'qcOnline', name:'其他線上支付', role:'inQc'},
+    {id:'line',     name:'LINE Pay', role:'inQc'},
+    {id:'jko',      name:'街口支付', role:'extra'},
     {id:'panda',    name:'foodpanda 訂單金額', role:'extra'}
   ],
   items: ['菜','牛','肉','冰','豆','蛋','米','雜貨','瓦斯','包材']
@@ -288,6 +287,11 @@ function localStore(){
     subMonth(ym, cb){ return sub('m:'+ym, () => cb(get('m:'+ym)||{}, meta)); },
     saveDay(ym, dd, d){ const m = get('m:'+ym)||{}; m[dd] = d; put('m:'+ym, m); notify('m:'+ym); return Promise.resolve(); },
     getMonthSync(ym){ return get('m:'+ym) || {}; },
+    migrateDays(fn){
+      if (!ls) return;
+      const keys = []; for (let i = 0; i < ls.length; i++) { const k = ls.key(i); if (k && k.startsWith('rbk:m:')) keys.push(k.slice(4)); }
+      keys.forEach(k => { const m = get(k) || {}; let any = false; Object.keys(m).forEach(dd => { if (fn(m[dd])) any = true; }); if (any) { put(k, m); notify(k); } });
+    },
     getKey(k){ return get('k:'+k); },
     setKey(k, v){ put('k:'+k, v); notify('k:'+k); return Promise.resolve(); },
     mergeDays(ym, patchFn){ const m = get('m:'+ym)||{}; const out = patchFn(m) || m; put('m:'+ym, out); notify('m:'+ym); return Promise.resolve(); },
@@ -499,7 +503,7 @@ function renderDay(){
       (d.imported ? '<div class="hint imported">已從快一點報表帶入' + (d.qcOrders ? '・' + d.qcOrders + ' 筆訂單' : '') + '</div>' : '') +
       (function(){
         let lastQc = -1; ch.forEach((c,i) => { if (c.role === 'qcTotal' || c.role === 'inQc') lastQc = i; });
-        const cashRow = '<div class="row cash-row"><span><b>現金</b><i class="tag">自動算</i><small class="hint">快一點總額 − LINE Pay − 街口 − 其他線上支付</small></span><b class="num" id="revCash">0</b></div>';
+        const cashRow = '<div class="row cash-row"><span><b>現金</b><i class="tag">自動算</i><small class="hint">快一點總額 − 線上付款（LINE Pay 等）</small></span><b class="num" id="revCash">0</b></div>';
         let html = lastQc < 0 ? cashRow : '';
         ch.forEach((c,i) => {
           html += '<label class="row" for="rev-' + esc(c.id) + '"><span>' + esc(c.name) +
@@ -507,7 +511,7 @@ function renderDay(){
             '</span><input class="amt" id="rev-' + esc(c.id) + '" data-rev="' + esc(c.id) + '" inputmode="numeric" autocomplete="off" placeholder="0" value="' + esc(showAmt(d.rev[c.id])) + '"></label>';
           if (c.role === 'inQc' && d.qcDetail) {
             const mine = Object.entries(d.qcDetail).filter(([k]) => payTypeChannel(k) === c.id);
-            if (mine.length && !(mine.length === 1 && mine[0][0] === c.name)) html += '<div class="detail-line">' + mine.sort((a,b) => b[1]-a[1]).map(([k,v]) => esc(k) + ' ' + fmt(v)).join('・') + '</div>';
+            if (mine.length && !(mine.length === 1 && mine[0][0] === c.name)) html += '<div class="detail-line">含 ' + mine.sort((a,b) => b[1]-a[1]).map(([k,v]) => esc(k) + ' ' + fmt(v)).join('・') + '</div>';
           }
           if (i === lastQc) html += cashRow;
         });
@@ -1193,16 +1197,27 @@ async function init(){
   S.store.subSettings((d) => {
     if (S.setDirty) return;
     const items = (d && Array.isArray(d.items)) ? d.items : clone(DEFAULT_SETTINGS.items);
-    let chs = null;
-    if (d && d.version === 4 && Array.isArray(d.channels) && d.channels.length) chs = d.channels;
-    else if (d && d.version === 3 && Array.isArray(d.channels) && d.channels.length) {
-      chs = d.channels.filter(c => c.id !== 'line' && c.id !== 'jko').map(c => c.id === 'qcOnline' ? Object.assign({}, c, {name: c.name === '快一點線上支付' ? '其他線上支付' : c.name}) : c);
-      const at = Math.max(0, chs.findIndex(c => c.role === 'qcTotal') + 1);
-      chs.splice(at, 0, clone(DEFAULT_SETTINGS.channels[1]), clone(DEFAULT_SETTINGS.channels[2]));
+    let chs = null, migrated = false;
+    if (d && d.version === 5 && Array.isArray(d.channels) && d.channels.length) chs = d.channels;
+    else if (d && (d.version === 3 || d.version === 4) && Array.isArray(d.channels) && d.channels.length) {
+      const base = d.channels.filter(c => !['qcOnline','line','jko'].includes(c.id));
+      const at = Math.max(0, base.findIndex(c => c.role === 'qcTotal') + 1);
+      base.splice(at, 0, clone(DEFAULT_SETTINGS.channels[1]), clone(DEFAULT_SETTINGS.channels[2]));
+      chs = base; migrated = true;
     }
     S.settings = chs
-      ? {version:4, float: Number(d.float) || 0, channels: chs.map(c => Object.assign({role:'extra'}, c)), items}
+      ? {version:5, float: Number(d.float) || 0, channels: chs.map(c => Object.assign({role:'extra'}, c)), items}
       : Object.assign(clone(DEFAULT_SETTINGS), {items, float: (d && Number(d.float)) || 0});
+    if (migrated) {
+      /* 舊版把 Apple Pay 等放在 qcOnline、把報表的「線上支付／櫃檯結帳」放在街口；街口現在是另一個 APP（另外收），所以搬到 LINE Pay（快一點線上付款） */
+      if (S.store.migrateDays) S.store.migrateDays(day => {
+        const r = day.rev || {}; let ch = false;
+        if (r.qcOnline != null) { r.line = (Number(r.line) || 0) + (Number(r.qcOnline) || 0); delete r.qcOnline; ch = true; }
+        if (day.imported && r.jko != null) { r.line = (Number(r.line) || 0) + (Number(r.jko) || 0); delete r.jko; ch = true; }
+        if (ch) day.rev = r; return ch;
+      });
+      S.store.saveSettings(clone(S.settings));
+    }
     if (S.tab === 'settings' && !focusedIn('#view-settings')) renderSettings();
     if (S.tab === 'day' && !focusedIn('#view-day')) renderDay();
     if (S.tab === 'month') renderMonth();
