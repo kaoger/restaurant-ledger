@@ -222,11 +222,13 @@ nav.tabs button[aria-current="page"]{color:var(--accent);font-weight:700}
 /* role: qcTotal = 快一點總營業額；inQc = 已包含在快一點總額內、扣掉才是現金；extra = 另外收的，加進總營業額 */
 const ROLE_LABEL = {qcTotal:'快一點總營業額', inQc:'包含在快一點總額內（扣掉才是現金）', extra:'另外收的（加進總營業額）'};
 const DEFAULT_SETTINGS = {
-  version: 3,
+  version: 4,
   float: 0,
   channels: [
     {id:'qcTotal',  name:'快一點總營業額', role:'qcTotal'},
-    {id:'qcOnline', name:'快一點線上支付', role:'inQc'},
+    {id:'line',     name:'LINE Pay', role:'inQc', match:['LINE Pay']},
+    {id:'jko',      name:'街口支付', role:'inQc', match:['街口支付','街口','線上支付','櫃檯結帳']},
+    {id:'qcOnline', name:'其他線上支付', role:'inQc'},
     {id:'panda',    name:'foodpanda 訂單金額', role:'extra'}
   ],
   items: ['菜','牛','肉','冰','豆','蛋','米','雜貨','瓦斯','包材']
@@ -497,14 +499,15 @@ function renderDay(){
       (d.imported ? '<div class="hint imported">已從快一點報表帶入' + (d.qcOrders ? '・' + d.qcOrders + ' 筆訂單' : '') + '</div>' : '') +
       (function(){
         let lastQc = -1; ch.forEach((c,i) => { if (c.role === 'qcTotal' || c.role === 'inQc') lastQc = i; });
-        const cashRow = '<div class="row cash-row"><span><b>現金</b><i class="tag">自動算</i><small class="hint">快一點總額 − 線上支付</small></span><b class="num" id="revCash">0</b></div>';
+        const cashRow = '<div class="row cash-row"><span><b>現金</b><i class="tag">自動算</i><small class="hint">快一點總額 − LINE Pay − 街口 − 其他線上支付</small></span><b class="num" id="revCash">0</b></div>';
         let html = lastQc < 0 ? cashRow : '';
         ch.forEach((c,i) => {
           html += '<label class="row" for="rev-' + esc(c.id) + '"><span>' + esc(c.name) +
             (c.role === 'inQc' ? '<i class="tag ghost">從快一點扣</i>' : '') +
             '</span><input class="amt" id="rev-' + esc(c.id) + '" data-rev="' + esc(c.id) + '" inputmode="numeric" autocomplete="off" placeholder="0" value="' + esc(showAmt(d.rev[c.id])) + '"></label>';
-          if (c.role === 'inQc' && d.qcDetail && Object.keys(d.qcDetail).length && c.id === firstInQcId()) {
-            html += '<div class="detail-line">' + Object.entries(d.qcDetail).sort((a,b) => b[1]-a[1]).map(([k,v]) => esc(k) + ' ' + fmt(v)).join('・') + '</div>';
+          if (c.role === 'inQc' && d.qcDetail) {
+            const mine = Object.entries(d.qcDetail).filter(([k]) => payTypeChannel(k) === c.id);
+            if (mine.length && !(mine.length === 1 && mine[0][0] === c.name)) html += '<div class="detail-line">' + mine.sort((a,b) => b[1]-a[1]).map(([k,v]) => esc(k) + ' ' + fmt(v)).join('・') + '</div>';
           }
           if (i === lastQc) html += cashRow;
         });
@@ -882,6 +885,14 @@ async function delPayout(id){
 }
 
 /* ---------- 快一點報表匯入 ---------- */
+/* Which inQc channel a 快一點 交易型態 goes to: the channel listing it in `match`, else the catch-all inQc channel (no match list) */
+function payTypeChannel(k){
+  const inQc = S.settings.channels.filter(c => c.role === 'inQc');
+  const hit = inQc.find(c => Array.isArray(c.match) && c.match.includes(k));
+  if (hit) return hit.id;
+  const all = inQc.find(c => !Array.isArray(c.match) || !c.match.length);
+  return all ? all.id : (inQc[0] && inQc[0].id);
+}
 function firstInQcId(){ const c = S.settings.channels.find(x => x.role === 'inQc'); return c ? c.id : null; }
 function qcTotalId(){ const c = S.settings.channels.find(x => x.role === 'qcTotal'); return c ? c.id : null; }
 /* Reads the 訂單列表 export: one row per item, order fields repeated. Groups by 訂單ID, skips cancelled orders,
@@ -929,7 +940,8 @@ async function importQcFile(rows){
   const list = Object.keys(days).sort();
   if (!list.length) { toast('報表裡沒有找到訂單'); return; }
   const totId = qcTotalId(), onId = firstInQcId();
-  if (!totId || !onId) { toast('請先到設定保留「快一點總營業額」和「快一點線上支付」兩欄'); return; }
+  if (!totId || !onId) { toast('請先到設定保留「快一點總營業額」和至少一個「包含在快一點總額內」的欄位'); return; }
+  const inQcIds = S.settings.channels.filter(c => c.role === 'inQc').map(c => c.id);
   const span = list[0].slice(5).replace('-','/') + ' 到 ' + list[list.length-1].slice(5).replace('-','/');
   if (!window.confirm('找到 ' + list.length + ' 天的訂單（' + span + '）。\n要把這幾天的「快一點總營業額」和「線上支付」換成報表的數字嗎？\n支出、現金盤點和 foodpanda 不會動。')) return;
   await flushDay();
@@ -943,7 +955,8 @@ async function importQcFile(rows){
         const cur = m[dd] ? clone(m[dd]) : {date: iso, rev:{}, exp:[], cashCounted:null, note:'', float: Number(S.settings.float) || 0};
         cur.rev = cur.rev || {};
         cur.rev[totId] = x.total;
-        cur.rev[onId] = x.total - x.cash;
+        inQcIds.forEach(id => { cur.rev[id] = 0; });
+        Object.entries(x.detail).forEach(([k,v]) => { const id = payTypeChannel(k) || onId; cur.rev[id] = (cur.rev[id] || 0) + v; });
         cur.qcDetail = x.detail; cur.qcOrders = x.orders; cur.imported = true; cur.updatedAt = now;
         m[dd] = cur;
       });
@@ -1180,8 +1193,15 @@ async function init(){
   S.store.subSettings((d) => {
     if (S.setDirty) return;
     const items = (d && Array.isArray(d.items)) ? d.items : clone(DEFAULT_SETTINGS.items);
-    S.settings = (d && d.version === 3 && Array.isArray(d.channels) && d.channels.length)
-      ? {version:3, float: Number(d.float) || 0, channels: d.channels.map(c => Object.assign({role:'extra'}, c)), items}
+    let chs = null;
+    if (d && d.version === 4 && Array.isArray(d.channels) && d.channels.length) chs = d.channels;
+    else if (d && d.version === 3 && Array.isArray(d.channels) && d.channels.length) {
+      chs = d.channels.filter(c => c.id !== 'line' && c.id !== 'jko').map(c => c.id === 'qcOnline' ? Object.assign({}, c, {name: c.name === '快一點線上支付' ? '其他線上支付' : c.name}) : c);
+      const at = Math.max(0, chs.findIndex(c => c.role === 'qcTotal') + 1);
+      chs.splice(at, 0, clone(DEFAULT_SETTINGS.channels[1]), clone(DEFAULT_SETTINGS.channels[2]));
+    }
+    S.settings = chs
+      ? {version:4, float: Number(d.float) || 0, channels: chs.map(c => Object.assign({role:'extra'}, c)), items}
       : Object.assign(clone(DEFAULT_SETTINGS), {items, float: (d && Number(d.float)) || 0});
     if (S.tab === 'settings' && !focusedIn('#view-settings')) renderSettings();
     if (S.tab === 'day' && !focusedIn('#view-day')) renderDay();
