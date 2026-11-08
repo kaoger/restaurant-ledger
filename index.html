@@ -140,6 +140,13 @@ table.ledger{border-collapse:collapse;font-size:13px;min-width:100%;white-space:
 .ledger tr.we td:first-child{color:var(--neg)}
 .ledger tbody tr{cursor:pointer}
 .ledger tfoot td{font-weight:700;border-top:2px solid var(--ink);border-bottom:0}
+.cash-row{background:var(--accent-soft);margin:0 -14px;padding:10px 14px;border-bottom:0}
+.cash-row>span{flex-direction:row}
+.cash-row small{font-size:11px;width:100%}
+.cash-row b.num{font-size:20px;color:var(--accent)}
+.cash-row b.num.neg{color:var(--neg)}
+.row small.hint{margin-left:2px}
+select.role{font-size:14px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--paper);color:var(--ink);max-width:100%}
 .ledger td.pos{color:var(--pos)}
 .ledger td.neg{color:var(--neg)}
 
@@ -195,15 +202,17 @@ nav.tabs button[aria-current="page"]{color:var(--accent);font-weight:700}
 'use strict';
 
 /* ---------- defaults ---------- */
+/* role: qcTotal = 快一點總營業額；inQc = 已包含在快一點總額內、扣掉才是現金；extra = 另外收的，加進總營業額 */
+const ROLE_LABEL = {qcTotal:'快一點總營業額', inQc:'包含在快一點總額內（扣掉才是現金）', extra:'另外收的（加進總營業額）'};
 const DEFAULT_SETTINGS = {
+  version: 2,
+  float: 0,
   channels: [
-    {id:'cash',  name:'現金',      cash:true,  inTotal:true},
-    {id:'qc',    name:'快一點',    cash:false, inTotal:true},
-    {id:'line',  name:'LINE Pay',  cash:false, inTotal:true},
-    {id:'pos',   name:'POS 刷卡',  cash:false, inTotal:true},
-    {id:'panda', name:'foodpanda', cash:false, inTotal:true},
-    {id:'uber',  name:'Uber Eats', cash:false, inTotal:true},
-    {id:'tf',    name:'轉帳',      cash:false, inTotal:true}
+    {id:'qcTotal',  name:'快一點總營業額', role:'qcTotal'},
+    {id:'qcOnline', name:'快一點線上支付', role:'inQc'},
+    {id:'line',     name:'LINE Pay',       role:'extra'},
+    {id:'jko',      name:'街口支付',       role:'extra'},
+    {id:'panda',    name:'foodpanda',      role:'extra'}
   ],
   items: ['菜','牛','肉','冰','豆','蛋','米','雜貨','瓦斯','包材']
 };
@@ -312,12 +321,25 @@ function loadDraft(){
 }
 function dayCalc(d){
   const ch = S.settings.channels;
-  let total = 0, cashRev = 0;
-  ch.forEach(c => { const v = Number(d.rev && d.rev[c.id]) || 0; if (c.inTotal) total += v; if (c.cash) cashRev += v; });
+  let qc = 0, inQc = 0, extra = 0;
+  ch.forEach(c => { const v = Number(d.rev && d.rev[c.id]) || 0; if (c.role === 'qcTotal') qc += v; else if (c.role === 'inQc') inQc += v; else extra += v; });
+  const cashRev = qc - inQc;
+  const total = qc + extra;
   const exp = (d.exp||[]).reduce((a,e) => a + (Number(e.amt)||0), 0);
-  const expect = cashRev - exp;
+  const float = dayFloat(d);
+  const expect = float + cashRev - exp;
   const counted = d.cashCounted == null ? null : Number(d.cashCounted);
-  return {total, cashRev, exp, expect, counted, diff: counted == null ? null : counted - expect};
+  return {total, qc, inQc, extra, cashRev, exp, float, expect, counted, diff: counted == null ? null : counted - expect};
+}
+function dayFloat(d){ return (d && d.float != null) ? Number(d.float) : (Number(S.settings.float) || 0); }
+/* Breakdown rows that add up to the total: computed cash, then each inQc and extra channel */
+function revParts(){
+  const ch = S.settings.channels;
+  return [{id:'__cash', name:'現金（快一點扣線上）'}].concat(ch.filter(c => c.role !== 'qcTotal').map(c => ({id:c.id, name:c.name})));
+}
+function partVal(d, c, id){
+  if (id === '__cash') return c.cashRev;
+  return Number(d.rev && d.rev[id]) || 0;
 }
 function dayHasData(d){
   return Object.values(d.rev||{}).some(v => v != null && v !== '') || (d.exp||[]).some(e => e.amt || (e.item||'').trim()) || d.cashCounted != null || (d.note||'').trim();
@@ -338,7 +360,7 @@ async function flushDay(){
   const rev = {};
   Object.keys(d.rev||{}).forEach(k => { if (d.rev[k] != null && d.rev[k] !== '') rev[k] = Number(d.rev[k]); });
   const exp = (d.exp||[]).filter(e => e.amt || (e.item||'').trim()).map(e => ({item:(e.item||'').trim(), amt: e.amt == null ? 0 : Number(e.amt)}));
-  const doc = {date:d.date, rev, exp, cashCounted: d.cashCounted == null ? null : Number(d.cashCounted), note: (d.note||'').trim(), updatedAt: new Date().toISOString()};
+  const doc = {date:d.date, rev, exp, float: dayFloat(d), cashCounted: d.cashCounted == null ? null : Number(d.cashCounted), note: (d.note||'').trim(), updatedAt: new Date().toISOString()};
   if (!S.days[dd] && !dayHasData(doc)) { S.dirtyDay = false; setSaveMsg(''); return; }
   S.savingDay = true; setSaveMsg('儲存中…');
   try {
@@ -453,11 +475,18 @@ function renderDay(){
     '<div style="display:flex;flex-direction:column;gap:12px">' +
     '<section class="card" aria-labelledby="h-rev">' +
       '<div class="card-h"><h2 id="h-rev">營收</h2><span class="hint">照快一點後台填</span></div>' +
-      ch.map(c =>
-        '<label class="row" for="rev-' + esc(c.id) + '"><span>' + esc(c.name) +
-          (c.cash ? '<i class="tag">現金</i>' : '') + (c.inTotal ? '' : '<i class="tag ghost">不計入總額</i>') +
-        '</span><input class="amt" id="rev-' + esc(c.id) + '" data-rev="' + esc(c.id) + '" inputmode="numeric" autocomplete="off" placeholder="0" value="' + esc(showAmt(d.rev[c.id])) + '"></label>'
-      ).join('') +
+      (function(){
+        let lastQc = -1; ch.forEach((c,i) => { if (c.role === 'qcTotal' || c.role === 'inQc') lastQc = i; });
+        const cashRow = '<div class="row cash-row"><span><b>現金</b><i class="tag">自動算</i><small class="hint">快一點總額 − 線上支付</small></span><b class="num" id="revCash">0</b></div>';
+        let html = lastQc < 0 ? cashRow : '';
+        ch.forEach((c,i) => {
+          html += '<label class="row" for="rev-' + esc(c.id) + '"><span>' + esc(c.name) +
+            (c.role === 'inQc' ? '<i class="tag ghost">從快一點扣</i>' : '') +
+            '</span><input class="amt" id="rev-' + esc(c.id) + '" data-rev="' + esc(c.id) + '" inputmode="numeric" autocomplete="off" placeholder="0" value="' + esc(showAmt(d.rev[c.id])) + '"></label>';
+          if (i === lastQc) html += cashRow;
+        });
+        return html;
+      })() +
       '<div class="total"><span>總營業額</span><b id="revTotal">0</b></div>' +
     '</section>' +
     '<section class="card" aria-labelledby="h-exp">' +
@@ -468,13 +497,14 @@ function renderDay(){
       '<div class="total"><span>支出合計</span><b id="expTotal">0</b></div>' +
     '</section>' +
     '<section class="card" aria-labelledby="h-cash">' +
-      '<div class="card-h"><h2 id="h-cash">現金盤點</h2><span class="hint">收店時數抽屜</span></div>' +
+      '<div class="card-h"><h2 id="h-cash">現金盤點</h2><span class="hint">收店時把抽屜全部的錢數一遍</span></div>' +
+      '<label class="row" for="dayFloat"><span>櫃檯預備金<small class="hint">今天的</small></span><input class="amt" id="dayFloat" inputmode="numeric" autocomplete="off" placeholder="0" value="' + esc(showAmt(dayFloat(d))) + '"></label>' +
       '<div class="calc">' +
-        '<div class="line"><span>現金營收</span><b id="cRev">0</b></div>' +
+        '<div class="line"><span>加 現金營收</span><b id="cRev">0</b></div>' +
         '<div class="line"><span>減 今日支出</span><b id="cExp">0</b></div>' +
-        '<div class="line strong"><span>應有現金</span><b id="cExpect">0</b></div>' +
+        '<div class="line strong"><span>抽屜應有</span><b id="cExpect">0</b></div>' +
       '</div>' +
-      '<label class="row" for="cashCounted"><span><b>實收現金</b></span><input class="amt" id="cashCounted" inputmode="numeric" autocomplete="off" placeholder="數完填這裡" value="' + esc(showAmt(d.cashCounted)) + '"></label>' +
+      '<label class="row" for="cashCounted"><span><b>實際數到</b></span><input class="amt" id="cashCounted" inputmode="numeric" autocomplete="off" placeholder="抽屜全部" value="' + esc(showAmt(d.cashCounted)) + '"></label>' +
       '<div class="diff" id="cDiff"><span>現金短溢</span><b>—</b></div>' +
     '</section>' +
     '<section class="card">' +
@@ -505,7 +535,8 @@ function updateDayTotals(){
   const set = (id, val) => { const el = $(id); if (el) el.textContent = val; };
   set('#revTotal', fmt(c.total));
   set('#expTotal', fmt(c.exp));
-  set('#cRev', fmt(c.cashRev));
+  const rc = $('#revCash'); if (rc) { rc.textContent = (c.cashRev < 0 ? '−' : '') + fmt(Math.abs(c.cashRev)); rc.classList.toggle('neg', c.cashRev < 0); }
+  set('#cRev', (c.cashRev < 0 ? '−' : '') + fmt(Math.abs(c.cashRev)));
   set('#cExp', '−' + fmt(c.exp));
   set('#cExpect', fmt(c.expect));
   const el = $('#cDiff');
@@ -519,7 +550,7 @@ function updateDayTotals(){
 function monthStats(){
   const ym = S.ym, n = daysIn(ym), ch = S.settings.channels;
   const rows = [];
-  const byCh = {}; ch.forEach(c => byCh[c.id] = 0);
+  const byCh = {__cash:0}; ch.forEach(c => byCh[c.id] = 0);
   const byItem = {};
   let rev = 0, exp = 0, diff = 0, recorded = 0, diffDays = 0;
   for (let i = 1; i <= n; i++) {
@@ -531,6 +562,7 @@ function monthStats(){
     rev += c.total; exp += c.exp;
     if (c.diff != null) { diff += c.diff; diffDays++; }
     ch.forEach(cc => byCh[cc.id] += Number(d.rev && d.rev[cc.id]) || 0);
+    byCh.__cash += c.cashRev;
     (d.exp||[]).forEach(e => { const k = (e.item||'').trim() || '未填品項'; byItem[k] = byItem[k] || {amt:0, n:0}; byItem[k].amt += Number(e.amt)||0; byItem[k].n++; });
     rows.push({iso, dd, w, d, c});
   }
@@ -544,7 +576,8 @@ function monthStats(){
 function renderMonth(){
   const st = monthStats(), ch = S.settings.channels;
   const v = $('#view-month');
-  const chMax = Math.max(1, ...ch.map(c => st.byCh[c.id]));
+  const rp = revParts();
+  const chMax = Math.max(1, ...rp.map(c => st.byCh[c.id]));
   const itMax = Math.max(1, ...st.items.map(i => i.amt));
   const memo = d => (d.exp||[]).filter(e => e.amt).map(e => (e.item||'') + e.amt).join('、');
 
@@ -553,7 +586,7 @@ function renderMonth(){
     '<div id="mSummary"></div>' +
 
     '<section class="card"><div class="card-h"><h2>營收管道</h2><span class="hint">本月合計</span></div>' +
-      '<div class="bars">' + ch.map(c => {
+      '<div class="bars">' + rp.map(c => {
         const val = st.byCh[c.id];
         return '<div class="bar-row"><span class="name">' + esc(c.name) + '</span><div class="bar"><i style="width:' + (val/chMax*100).toFixed(1) + '%"></i></div><span class="v">' + fmt(val) + '</span></div>';
       }).join('') + '</div></section>' +
@@ -572,20 +605,21 @@ function renderMonth(){
     '<section class="card"><div class="card-h"><h2>每日明細</h2><span class="hint">點一列可以去改那天</span></div>' +
       '<div class="table-wrap"><table class="ledger"><thead><tr><th>日期</th><th>總營業額</th>' +
         ch.map(c => '<th>' + esc(c.name) + '</th>').join('') +
-        '<th>支出</th><th>現金短溢</th><th style="text-align:left">支出明細</th></tr></thead><tbody>' +
+        '<th>現金</th><th>支出</th><th>現金短溢</th><th style="text-align:left">支出明細</th></tr></thead><tbody>' +
         st.rows.map(r => {
           const cls = (r.d ? '' : 'blank') + ((r.w === 0 || r.w === 6) ? ' we' : '');
           const label = parseInt(r.dd,10) + '（' + WD[r.w] + '）';
-          if (!r.d) return '<tr class="' + cls + '" data-go="' + r.iso + '"><td>' + label + '</td><td>—</td>' + ch.map(() => '<td></td>').join('') + '<td></td><td></td><td class="memo"></td></tr>';
+          if (!r.d) return '<tr class="' + cls + '" data-go="' + r.iso + '"><td>' + label + '</td><td>—</td>' + ch.map(() => '<td></td>').join('') + '<td></td><td></td><td></td><td class="memo"></td></tr>';
           const df = r.c.diff;
           return '<tr class="' + cls + '" data-go="' + r.iso + '"><td>' + label + '</td><td>' + fmt(r.c.total) + '</td>' +
             ch.map(c => { const x = r.d.rev && r.d.rev[c.id]; return '<td>' + (x ? fmt(x) : '') + '</td>'; }).join('') +
+            '<td class="' + (r.c.cashRev < 0 ? 'neg' : '') + '">' + (r.c.cashRev < 0 ? '−' : '') + fmt(Math.abs(r.c.cashRev)) + '</td>' +
             '<td>' + (r.c.exp ? fmt(r.c.exp) : '') + '</td>' +
             '<td class="' + (df > 0 ? 'pos' : df < 0 ? 'neg' : '') + '">' + (df == null ? '' : fmtS(df)) + '</td>' +
             '<td class="memo">' + esc(memo(r.d)) + '</td></tr>';
         }).join('') +
       '</tbody><tfoot><tr><td>累計</td><td>' + fmt(st.rev) + '</td>' + ch.map(c => '<td>' + fmt(st.byCh[c.id]) + '</td>').join('') +
-        '<td>' + fmt(st.exp) + '</td><td class="' + (st.diff > 0 ? 'pos' : st.diff < 0 ? 'neg' : '') + '">' + (st.diffDays ? fmtS(st.diff) : '') + '</td><td></td></tr></tfoot></table></div>' +
+        '<td>' + fmt(st.byCh.__cash) + '</td><td>' + fmt(st.exp) + '</td><td class="' + (st.diff > 0 ? 'pos' : st.diff < 0 ? 'neg' : '') + '">' + (st.diffDays ? fmtS(st.diff) : '') + '</td><td></td></tr></tfoot></table></div>' +
     '</section>' +
 
     '<section class="card"><div class="card-h"><h2>匯出</h2><span class="hint">日報表、支出明細、品項彙總、月損益四張工作表</span></div>' +
@@ -650,17 +684,20 @@ function renderSettings(){
     (S.store.persistent ? '資料存在這支手機的瀏覽器裡，不會上傳到任何地方。換手機、清除瀏覽資料或刪掉主畫面圖示，資料就會不見，所以請定期備份。iPhone 請用「加入主畫面」的圖示打開，資料才不會被 Safari 自動清掉。' : '這個瀏覽器不能存資料（可能開了無痕模式），重新整理就會不見。');
   v.innerHTML =
     '<div style="display:flex;flex-direction:column;gap:12px">' +
-    '<section class="card"><div class="card-h"><h2>營收管道</h2><span class="hint">對照後台或手帳的欄位</span></div>' +
+    '<section class="card"><div class="card-h"><h2>櫃檯預備金</h2><span class="hint">每天開店前放在抽屜的零錢</span></div>' +
+      '<label class="row" for="defFloat"><span>預設金額</span><input class="amt" id="defFloat" inputmode="numeric" autocomplete="off" placeholder="0" value="' + esc(showAmt(s.float || '')) + '"></label>' +
+      '<div class="hint">新的一天會自動帶入這個金額，某天不一樣可以在當天的「現金盤點」改。</div>' +
+    '</section>' +
+    '<section class="card"><div class="card-h"><h2>營收管道</h2><span class="hint">現金＝快一點總額扣掉「包含在快一點內」的項目</span></div>' +
       s.channels.map((c,i) =>
         '<div class="ch-row">' +
           '<input class="txt" id="chn-' + i + '" data-chname="' + i + '" value="' + esc(c.name) + '" aria-label="管道名稱">' +
           '<div style="display:flex;gap:6px"><button class="mini" data-chup="' + i + '" aria-label="上移"' + (i === 0 ? ' disabled' : '') + '>↑</button><button class="mini" data-chdel="' + i + '" aria-label="刪除">×</button></div>' +
-          '<div class="ch-opts">' +
-            '<label for="chc-' + i + '"><input type="checkbox" id="chc-' + i + '" data-chcash="' + i + '"' + (c.cash ? ' checked' : '') + '>收現金（算進抽屜）</label>' +
-            '<label for="cht-' + i + '"><input type="checkbox" id="cht-' + i + '" data-chtotal="' + i + '"' + (c.inTotal ? ' checked' : '') + '>計入總營業額</label>' +
-          '</div>' +
+          '<div class="ch-opts"><label for="chr-' + i + '" style="width:100%">這一欄是：<select class="role" id="chr-' + i + '" data-chrole="' + i + '">' +
+            Object.keys(ROLE_LABEL).map(r => '<option value="' + r + '"' + (c.role === r ? ' selected' : '') + '>' + ROLE_LABEL[r] + '</option>').join('') +
+          '</select></label></div>' +
         '</div>').join('') +
-      '<div class="add-line" style="margin-top:6px"><input class="txt" id="newCh" placeholder="新增管道，例如 GoFoodie"><button class="btn" data-act="addCh">新增</button></div>' +
+      '<div class="add-line" style="margin-top:6px"><input class="txt" id="newCh" placeholder="新增管道，例如 Uber Eats"><button class="btn" data-act="addCh">新增</button></div>' +
       '<div class="hint">刪掉管道不會刪掉以前的資料，只是不再顯示。</div>' +
     '</section>' +
     '<section class="card"><div class="card-h"><h2>常用支出品項</h2><span class="hint">每日記帳頁的快速按鈕</span></div>' +
@@ -689,15 +726,15 @@ function scheduleSettingsSave(){
 /* ---------- export ---------- */
 function buildTables(){
   const st = monthStats(), ch = S.settings.channels;
-  const daily = [['日期','星期','總營業額', ...ch.map(c => c.name), '支出合計','支出明細','應有現金','實收現金','現金短溢','備註']];
+  const daily = [['日期','星期','總營業額', ...ch.map(c => c.name), '現金（計算）', '支出合計','支出明細','櫃檯預備金','抽屜應有','實際數到','現金短溢','備註']];
   st.rows.forEach(r => {
     const dateLabel = r.iso.replace(/-/g,'/');
     if (!r.d) { daily.push([dateLabel, WD[r.w]]); return; }
-    daily.push([dateLabel, WD[r.w], r.c.total, ...ch.map(c => (r.d.rev && r.d.rev[c.id] != null) ? Number(r.d.rev[c.id]) : ''),
+    daily.push([dateLabel, WD[r.w], r.c.total, ...ch.map(c => (r.d.rev && r.d.rev[c.id] != null) ? Number(r.d.rev[c.id]) : ''), r.c.cashRev,
       r.c.exp, (r.d.exp||[]).filter(e => e.amt).map(e => (e.item||'') + e.amt).join('、'),
-      r.c.expect, r.c.counted == null ? '' : r.c.counted, r.c.diff == null ? '' : r.c.diff, r.d.note || '']);
+      r.c.float, r.c.expect, r.c.counted == null ? '' : r.c.counted, r.c.diff == null ? '' : r.c.diff, r.d.note || '']);
   });
-  daily.push(['累計','', st.rev, ...ch.map(c => st.byCh[c.id]), st.exp, '', '', '', st.diffDays ? st.diff : '', '']);
+  daily.push(['累計','', st.rev, ...ch.map(c => st.byCh[c.id]), st.byCh.__cash, st.exp, '', '', '', '', st.diffDays ? st.diff : '', '']);
 
   const detail = [['日期','品項','金額']];
   st.rows.forEach(r => { if (r.d) (r.d.exp||[]).forEach(e => detail.push([r.iso.replace(/-/g,'/'), e.item || '未填品項', Number(e.amt)||0])); });
@@ -707,7 +744,7 @@ function buildTables(){
   items.push(['合計', st.items.reduce((a,b) => a + b.n, 0), st.exp, st.exp ? 1 : 0]);
 
   const pl = [[rocYM(S.ym) + ' 損益表',''], ['',''], ['營業收入','']];
-  ch.forEach(c => pl.push(['　' + c.name + (c.inTotal ? '' : '（不計入）'), st.byCh[c.id]]));
+  revParts().forEach(c => pl.push(['　' + c.name, st.byCh[c.id]]));
   pl.push(['總營業額', st.rev], ['',''], ['每日支出（依品項）','']);
   st.items.forEach(it => pl.push(['　' + it.name, it.amt]));
   pl.push(['每日支出合計', st.exp], ['',''], ['月固定支出','']);
@@ -723,7 +760,7 @@ async function exportXlsx(){
   const t = buildTables();
   const wb = XLSX.utils.book_new();
   const add = (aoa, name, widths) => { const ws = XLSX.utils.aoa_to_sheet(aoa); ws['!cols'] = widths.map(w => ({wch:w})); XLSX.utils.book_append_sheet(wb, ws, name); return ws; };
-  add(t.daily, '日報表', [11,5,11, ...S.settings.channels.map(() => 10), 10, 34, 10, 10, 9, 16]);
+  add(t.daily, '日報表', [11,5,11, ...S.settings.channels.map(() => 12), 11, 10, 34, 10, 10, 10, 9, 16]);
   add(t.detail, '支出明細', [11,14,10]);
   const wsI = add(t.items, '支出品項彙總', [14,7,10,11]);
   for (let r = 1; r < t.items.length; r++) { const c = wsI[XLSX.utils.encode_cell({r, c:3})]; if (c) c.z = '0.0%'; }
@@ -801,7 +838,7 @@ document.addEventListener('click', async (ev) => {
     case 'backup': backup(); return;
     case 'addCh': {
       const inp = $('#newCh'); const name = inp.value.trim(); if (!name) { inp.focus(); return; }
-      S.settings.channels.push({id: uid(), name, cash:false, inTotal:true}); scheduleSettingsSave(); renderSettings(); return;
+      S.settings.channels.push({id: uid(), name, role:'extra'}); scheduleSettingsSave(); renderSettings(); return;
     }
     case 'addItem': {
       const inp = $('#newItem'); const name = inp.value.trim(); if (!name) { inp.focus(); return; }
@@ -838,6 +875,8 @@ document.addEventListener('input', (ev) => {
   if (ds.rev !== undefined) { S.draft.rev[ds.rev] = parseAmt(t.value); cleanAmt(t); updateDayTotals(); scheduleDaySave(); return; }
   if (ds.expitem !== undefined) { S.draft.exp[Number(ds.expitem)].item = t.value; scheduleDaySave(); return; }
   if (ds.expamt !== undefined) { S.draft.exp[Number(ds.expamt)].amt = parseAmt(t.value); cleanAmt(t); updateDayTotals(); scheduleDaySave(); return; }
+  if (t.id === 'dayFloat') { S.draft.float = parseAmt(t.value) == null ? 0 : parseAmt(t.value); cleanAmt(t); updateDayTotals(); scheduleDaySave(); return; }
+  if (t.id === 'defFloat') { S.settings.float = parseAmt(t.value) || 0; cleanAmt(t); scheduleSettingsSave(); if (S.draft && !S.days[S.date.slice(8)] && S.draft.float == null) updateDayTotals(); return; }
   if (t.id === 'cashCounted') { S.draft.cashCounted = parseAmt(t.value); cleanAmt(t); updateDayTotals(); scheduleDaySave(); return; }
   if (t.id === 'note') { S.draft.note = t.value; scheduleDaySave(); return; }
   if (ds.fixname !== undefined) { S.fixed.items[Number(ds.fixname)].name = t.value; scheduleFixedSave(); return; }
@@ -848,8 +887,7 @@ document.addEventListener('change', (ev) => {
   const t = ev.target, ds = t.dataset;
   if (t.id === 'datePick' && t.value) { goDate(t.value); return; }
   if (t.id === 'restoreFile' && t.files && t.files[0]) { restore(t.files[0]); t.value = ''; return; }
-  if (ds.chcash !== undefined) { S.settings.channels[Number(ds.chcash)].cash = t.checked; scheduleSettingsSave(); return; }
-  if (ds.chtotal !== undefined) { S.settings.channels[Number(ds.chtotal)].inTotal = t.checked; scheduleSettingsSave(); return; }
+  if (ds.chrole !== undefined) { S.settings.channels[Number(ds.chrole)].role = t.value; scheduleSettingsSave(); return; }
 });
 document.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Enter') return;
@@ -888,7 +926,10 @@ async function init(){
   else if (!lastBackupRecent()) showNotice('資料只存在這支手機。每個月記得到「月報表」匯出 Excel，或到「設定」備份一次。', false);
   S.store.subSettings((d) => {
     if (S.setDirty) return;
-    S.settings = (d && Array.isArray(d.channels) && d.channels.length) ? {channels: d.channels, items: Array.isArray(d.items) ? d.items : clone(DEFAULT_SETTINGS.items)} : clone(DEFAULT_SETTINGS);
+    const items = (d && Array.isArray(d.items)) ? d.items : clone(DEFAULT_SETTINGS.items);
+    S.settings = (d && d.version === 2 && Array.isArray(d.channels) && d.channels.length)
+      ? {version:2, float: Number(d.float) || 0, channels: d.channels.map(c => Object.assign({role:'extra'}, c)), items}
+      : Object.assign(clone(DEFAULT_SETTINGS), {items});
     if (S.tab === 'settings' && !focusedIn('#view-settings')) renderSettings();
     if (S.tab === 'day' && !focusedIn('#view-day')) renderDay();
     if (S.tab === 'month') renderMonth();
