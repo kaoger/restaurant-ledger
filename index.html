@@ -361,7 +361,7 @@ function dayFloat(d){ return (d && d.float != null) ? Number(d.float) : (Number(
 /* Breakdown rows that add up to the total: computed cash, then each inQc and extra channel */
 function revParts(){
   const ch = S.settings.channels;
-  return [{id:'__cash', name:'現金（快一點扣線上）'}].concat(ch.filter(c => c.role !== 'qcTotal').map(c => ({id:c.id, name:c.name})));
+  return [{id:'__cash', name:'現金'}].concat(ch.filter(c => c.role !== 'qcTotal').map(c => ({id:c.id, name:c.name})));
 }
 function partVal(d, c, id){
   if (id === '__cash') return c.cashRev;
